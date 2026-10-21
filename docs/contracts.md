@@ -14,6 +14,11 @@ embeds the same numbers in the generated bindings, and `@stellar-starter-kit/sdk
 surfaces them to callers, so a variant must never be renumbered or removed:
 **append only.**
 
+All three contracts expose `version() -> u32`, sourced from the shared
+`CONTRACT_VERSION` constant in `contracts/version/src/lib.rs`. The value
+identifies the interface generation, not the deployed WASM: bump the constant
+once for a release that changes an interface, and every contract reports it.
+
 ---
 
 ## `stream` — `StreamContract`
@@ -181,8 +186,8 @@ read the transfers, while the event is the record of _why_ they happened.
 
 ## `escrow` — `EscrowContract`
 
-Two-party payment with a third-party arbiter, keyed by a caller-chosen id, with
-deadline-driven cancellation.
+Two-party payment with a third-party arbiter, keyed by a contract-assigned id,
+with deadline-driven cancellation.
 
 ### Entry points
 
@@ -205,9 +210,18 @@ struct Escrow {
 enum EscrowStatus { Created = 0, Funded = 1, Released = 2, Refunded = 3, Cancelled = 4 }
 ```
 
-Unlike `stream` and `splits`, the escrow id is **supplied by the caller** to
-`create_escrow`; it is not issued by the contract, so ids are only unique per
-deployer discipline, and reusing a live id returns code `2`.
+Ids are assigned by the contract from a `NextId` counter in instance storage,
+exactly like `stream` and `splits`: the first escrow is `1`, and each successful
+`create_escrow` increments the counter, stores the escrow under the new id and
+returns it. `next_escrow_id` reports the id the next creation will receive
+without changing anything, and every creation extends the instance entry that
+holds the counter with the same `BUMP_THRESHOLD` / `BUMP_LIMIT` window used for
+the escrow entries.
+
+Because the contract issues the id, a creation can no longer collide with an
+existing escrow. `EscrowAlreadyExists` (code `2`) was therefore removed; the
+discriminant is retired rather than reused so every other error code keeps its
+value.
 
 `release_escrow` and `refund_escrow` take `caller` as an explicit argument and
 compare it against the stored roles after `caller.require_auth()`. That argument
