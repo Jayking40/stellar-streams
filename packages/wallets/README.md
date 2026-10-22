@@ -1,8 +1,8 @@
 # @stellar-starter-kit/wallets
 
 React provider and wallet adapters for the Stellar Streams dashboard. It wraps
-Freighter, Albedo, Rabet, and Hana behind one `useWallet()` hook so pages never
-touch a wallet SDK directly.
+Freighter, Albedo, Rabet, Hana, and Ledger behind one `useWallet()` hook so
+pages never touch a wallet SDK directly.
 
 ## Mounting the provider
 
@@ -42,6 +42,87 @@ instead of returning an unsigned entry.
 
 An auth-entry flow that targets a wallet without this capability is a
 follow-up feature, not something the dashboard should attempt today.
+
+## Ledger hardware wallet
+
+`LedgerAdapter` signs with the Stellar app on a Ledger device and is selected
+with `connect('ledger')`, like every other wallet:
+
+```ts
+const { connect } = useWallet();
+await connect('ledger');
+```
+
+The adapter is also usable without React:
+
+```ts
+import { LedgerAdapter } from '@stellar-starter-kit/wallets';
+
+const ledger = new LedgerAdapter({
+  derivationPath: "44'/148'/0'",
+  networkPassphrase: 'Test SDF Network ; September 2015',
+});
+
+const address = await ledger.connect();
+const signedXdr = await ledger.signTransaction(xdr, { network: 'TESTNET' });
+await ledger.disconnect();
+```
+
+### How it works
+
+- **Connect.** `connect()` opens a WebHID transport, loads the Stellar app
+  binding, and derives the address at the configured path (`display = false`,
+  so there is no device confirmation prompt). `getPublicKey()` reuses the
+  connected key or connects on demand.
+- **Sign.** `signTransaction(xdr, opts)` parses the envelope with the SDK,
+  sends its signature base to the device, and returns the envelope with the
+  device signature attached. The provider passes its active network passphrase
+  when signing.
+- **Disconnect.** `disconnect()` closes the HID session and forgets the public
+  key; `WalletProvider.disconnect()` calls it automatically and ignores errors
+  from an already unplugged device. It is safe to call when idle.
+- **Code-split transport.** `@ledgerhq/hw-transport-webhid` and
+  `@ledgerhq/hw-app-str` are loaded with a dynamic `import()` inside the
+  connect path. Bundlers emit them as a separate chunk, so pages that never
+  select Ledger never download the transport and the default bundle stays free
+  of Ledger code.
+
+### Configuration
+
+| Option            | Default                | Purpose                                                                                      |
+| :---------------- | :--------------------- | :------------------------------------------------------------------------------------------- |
+| `derivationPath`  | `44'/148'/0'`          | Account-level Stellar path. Anything that is not `44'/148'/<account>'` is rejected up front. |     | `networkPassphrase` | follows the signing call | Pins the network the adapter may sign for; Testnet applies when no network is named. |
+| `createTransport` | WebHID loader          | Overrides the transport loader, e.g. for a non-WebHID host or a test harness.                |
+| `loadStellarApp`  | `@ledgerhq/hw-app-str` | Overrides the app binding loader (tests).                                                    |
+
+A signature is only valid for the network id the host hashed into the
+signature base, and the Stellar app cannot report which network it expects.
+Without a pinned passphrase the adapter signs for the network that
+`signTransaction` names (which is how `WalletProvider` passes its active
+network). With a pinned passphrase, a signing request that names a different
+network is rejected with `LedgerConfigurationError` before any device call:
+
+```
+The Ledger adapter is configured for Testnet but Mainnet was requested.
+Configure the adapter with the same networkPassphrase the transaction was built for.
+```
+
+### Limitations
+
+- **WebHID is required.** Chromium-based browsers over HTTPS work; Safari and
+  Firefox do not expose WebHID. `isAvailable()` returns `false` and `connect()`
+  explains why instead of hanging.
+- **The Stellar app must be open and the device unlocked.** A closed app is
+  reported as `The Stellar app is not open on the Ledger device. Open it on the
+device and try again.`; a locked device reports that it is locked.
+- **No auth-entry signing.** `signAuthEntry` is not implemented, so
+  `WalletProvider.signAuthEntry` raises `NotSupportedError` for Ledger.
+- **Device size limits.** The Stellar app can only sign payloads up to its
+  reported `maxDataSize`; oversized transactions fail with `The transaction is
+too large for the Ledger device to sign.`
+- **No on-device network display.** The adapter enforces the network passphrase
+  in code; the device itself signs the digest it is given, so the mismatch guard
+  is the only protection against signing for the wrong network.
 
 ## Usage
 

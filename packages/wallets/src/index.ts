@@ -4,6 +4,7 @@ export const WALLET_PROVIDERS = {
   ALBEDO: 'albedo',
   RABE: 'rabe',
   HANA: 'hana',
+  LEDGER: 'ledger',
 } as const;
 
 export type WalletProviderType = (typeof WALLET_PROVIDERS)[keyof typeof WALLET_PROVIDERS];

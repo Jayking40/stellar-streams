@@ -53,4 +53,12 @@ export interface WalletAdapter {
    * `WalletProvider.signAuthEntry` throws `NotSupportedError` otherwise.
    */
   signAuthEntry?(entryXdr: string, opts?: SignTransactionOptions): Promise<string>;
+  /**
+   * Release any wallet session or device connection.
+   *
+   * Optional because extension wallets hold no session of their own; hardware
+   * wallets such as Ledger implement it to close the transport. `WalletProvider`
+   * calls it on `disconnect()` when present.
+   */
+  disconnect?(): Promise<void>;
 }

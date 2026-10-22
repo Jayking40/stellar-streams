@@ -5,12 +5,13 @@ import {
   AlbedoAdapter,
   FreighterAdapter,
   HanaAdapter,
+  LedgerAdapter,
   RabetAdapter,
   type WalletAdapter,
 } from './adapters/index.js';
 import { isUserRejection, NotSupportedError, toSigningError } from './errors.js';
 
-export type WalletType = 'freighter' | 'albedo' | 'rabe' | 'hana';
+export type WalletType = 'freighter' | 'albedo' | 'rabe' | 'hana' | 'ledger';
 
 export interface WalletContextType {
   activeAddress: string | null;
@@ -48,6 +49,9 @@ const ADAPTERS: Record<WalletType, WalletAdapter> = {
   albedo: new AlbedoAdapter(),
   rabe: new RabetAdapter(),
   hana: new HanaAdapter(),
+  // The adapter only imports Ledger's device packages dynamically, so this does
+  // not pull a transport into the default bundle.
+  ledger: new LedgerAdapter(),
 };
 
 export function WalletProvider({ children }: { children: React.ReactNode }) {

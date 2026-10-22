@@ -25,6 +25,23 @@ vi.mock('@albedo-link/intent', () => ({
   },
 }));
 
+// Ledger's device packages are imported dynamically by the adapter; mock them so
+// the provider test never needs a device (or WebHID).
+const ledgerMocks = vi.hoisted(() => {
+  const close = vi.fn(async () => {});
+  const create = vi.fn(async () => ({ close }));
+  return { close, create };
+});
+
+vi.mock('@ledgerhq/hw-transport-webhid', () => ({ default: { create: ledgerMocks.create } }));
+vi.mock('@ledgerhq/hw-app-str', () => ({
+  default: class MockStellarApp {
+    async getPublicKey() {
+      return { rawPublicKey: new Uint8Array(32).fill(1) };
+    }
+  },
+}));
+
 // Helper component to access useWallet hooks in tests
 function TestComponent() {
   const {
@@ -60,6 +77,7 @@ function TestComponent() {
       <button onClick={() => connect('albedo').catch(() => {})}>Connect Albedo</button>
       <button onClick={() => connect('rabe').catch(() => {})}>Connect Rabet</button>
       <button onClick={() => connect('hana').catch(() => {})}>Connect Hana</button>
+      <button onClick={() => connect('ledger').catch(() => {})}>Connect Ledger</button>
       <button onClick={disconnect}>Disconnect</button>
       <button
         onClick={() =>
@@ -299,6 +317,33 @@ describe('WalletProvider', () => {
     expect(screen.getByTestId('address').textContent).toBe('GB_HANA');
     expect(screen.getByTestId('provider').textContent).toBe('hana');
     expect(screen.getByTestId('connected').textContent).toBe('true');
+  });
+
+  it('should connect to Ledger and release the transport on disconnect', async () => {
+    Object.defineProperty(navigator, 'hid', { value: {}, configurable: true });
+
+    render(
+      <WalletProvider>
+        <TestComponent />
+      </WalletProvider>,
+    );
+
+    await act(async () => {
+      screen.getByText('Connect Ledger').click();
+    });
+
+    expect(screen.getByTestId('provider').textContent).toBe('ledger');
+    expect(screen.getByTestId('address').textContent).toMatch(/^G[A-Z0-9]{55}$/);
+    expect(localStorage.getItem('stellar_starter_kit_wallet_provider')).toBe('ledger');
+
+    await act(async () => {
+      screen.getByText('Disconnect').click();
+    });
+
+    expect(ledgerMocks.close).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('connected').textContent).toBe('false');
+
+    delete (navigator as Navigator & { hid?: unknown }).hid;
   });
 
   it('should surface a missing Freighter extension without persisting a session', async () => {
