@@ -51,7 +51,6 @@ pub enum StreamError {
     AlreadyInitialized = 9,
     TreasuryNotSet = 10,
     MetadataTooLong = 11,
-    SameRecipient = 12,
     InvalidStartTime = 12,
     EmptyBatch = 13,
     BatchTooLarge = 14,
@@ -64,6 +63,8 @@ pub enum StreamError {
     StreamCompleted = 18,
     /// Issue #181: `top_up` arithmetic would exceed the supported range.
     AmountOverflow = 19,
+    /// `transfer_recipient` was asked to hand a stream to its current recipient.
+    SameRecipient = 20,
 }
 
 /// A single linear payment stream. Tokens are locked in the contract and vest
@@ -157,6 +158,36 @@ pub struct StreamCancelled {
     pub sender: Address,
     /// Unvested amount refunded to the sender.
     pub refunded: i128,
+}
+
+/// Emitted when the admin changes the protocol fee.
+#[contractevent(topics = ["stream", "fee_set"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeUpdated {
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+}
+
+/// Emitted when the admin changes the treasury address.
+#[contractevent(topics = ["stream", "treasury"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryUpdated {
+    pub treasury: Address,
+}
+
+#[contractevent]
+pub struct StreamPaused {
+    #[topic]
+    pub id: u64,
+    pub paused_at: u64,
+}
+
+#[contractevent]
+pub struct StreamResumed {
+    #[topic]
+    pub id: u64,
+    pub resumed_at: u64,
+    pub total_paused: u64,
 }
 
 /// Emitted when the recipient hands a stream off to a new address.

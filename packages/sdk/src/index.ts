@@ -528,6 +528,10 @@ export type StreamErrorCode =
   | 'ALREADY_INITIALIZED'
   | 'TREASURY_NOT_SET'
   | 'METADATA_TOO_LONG'
+  | 'INVALID_START_TIME'
+  | 'EMPTY_BATCH'
+  | 'BATCH_TOO_LARGE'
+  | 'BATCH_OVERFLOW'
   | 'SAME_RECIPIENT';
 
 /**
@@ -572,7 +576,11 @@ const STREAM_ERROR_CODES: Record<number, StreamErrorCode> = {
   9: 'ALREADY_INITIALIZED',
   10: 'TREASURY_NOT_SET',
   11: 'METADATA_TOO_LONG',
-  12: 'SAME_RECIPIENT',
+  12: 'INVALID_START_TIME',
+  13: 'EMPTY_BATCH',
+  14: 'BATCH_TOO_LARGE',
+  15: 'BATCH_OVERFLOW',
+  20: 'SAME_RECIPIENT',
 };
 
 /**
@@ -840,6 +848,11 @@ abstract class SorobanClient {
       throw new Error('No contract id configured.');
     }
     return new Contract(this.options.contractId);
+  }
+
+  /** The connected wallet's address, for calls that pass it as an argument. */
+  protected get publicKey(): string | undefined {
+    return this.options.publicKey;
   }
 
   /**
@@ -1614,6 +1627,44 @@ export class StreamsClient extends SorobanClient {
   ): Promise<WriteResultFor<O>> {
     return this.invoke('cancel', [nativeToScVal(BigInt(id), { type: 'u64' })], opts);
   }
+
+  /**
+   * Hand a stream off to `newRecipient`, e.g. after a key rotation or a sale.
+   * The connected wallet signs as the contract's `caller` and must be the
+   * stream's current recipient, otherwise the call fails with `UNAUTHORIZED`.
+   *
+   * Everything not yet withdrawn — including a balance that has vested but was
+   * never claimed — becomes withdrawable by `newRecipient` only, so call
+   * `withdraw` first to keep what has already vested.
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @param newRecipient - The `G...` or `C...` address that takes over the stream.
+   * @param opts - per-call write options; `opts.signal` aborts the prompt, submission and poll.
+   * @returns The hash of the confirmed transaction.
+   * @throws Error when no `publicKey` was configured, or `newRecipient` is not a valid address.
+   * @throws StreamsError when the contract rejects the call — `STREAM_NOT_FOUND`,
+   *   `UNAUTHORIZED` or `SAME_RECIPIENT`.
+   */
+  async transferRecipient<O extends WriteOptions = WriteOptions>(
+    id: bigint | number | string,
+    newRecipient: string,
+    opts: O = {} as O,
+  ): Promise<WriteResultFor<O>> {
+    const { publicKey } = this;
+    if (!publicKey) {
+      throw new Error('A connected wallet is required to submit transactions.');
+    }
+    assertAddress(newRecipient, 'newRecipient');
+    return this.invoke(
+      'transfer_recipient',
+      [
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+        addressToScVal(publicKey),
+        addressToScVal(newRecipient),
+      ],
+      opts,
+    );
+  }
 }
 
 /**
@@ -1658,78 +1709,63 @@ export class EscrowClient extends SorobanClient {
     );
   }
 
-  /** Withdraw the vested balance of a stream to its recipient. */
-  async withdraw(id: bigint | number | string): Promise<{ hash: string }> {
-    return this.invoke('withdraw', nativeToScVal(BigInt(id), { type: 'u64' }));
+  /** Fund the escrow, transferring its amount of the token from the payer. */
+  async fundEscrow<O extends WriteOptions = WriteOptions>(
+    id: bigint | number | string,
+    opts: O = {} as O,
+  ): Promise<WriteResultFor<O>> {
+    return this.invoke('fund_escrow', [nativeToScVal(BigInt(id), { type: 'u64' })], opts);
   }
 
-  /** Cancel a stream, refunding the unvested balance to the sender. */
-  async cancel(id: bigint | number | string): Promise<{ hash: string }> {
-    return this.invoke('cancel', nativeToScVal(BigInt(id), { type: 'u64' }));
+  /** Release the funds to the payee. `caller` must be the payer or the arbiter. */
+  async releaseEscrow<O extends WriteOptions = WriteOptions>(
+    id: bigint | number | string,
+    caller: string,
+    opts: O = {} as O,
+  ): Promise<WriteResultFor<O>> {
+    return this.invoke(
+      'release_escrow',
+      [nativeToScVal(BigInt(id), { type: 'u64' }), addressToScVal(caller)],
+      opts,
+    );
+  }
+
+  /** Refund the funds to the payer. `caller` must be the payee or the arbiter. */
+  async refundEscrow<O extends WriteOptions = WriteOptions>(
+    id: bigint | number | string,
+    caller: string,
+    opts: O = {} as O,
+  ): Promise<WriteResultFor<O>> {
+    return this.invoke(
+      'refund_escrow',
+      [nativeToScVal(BigInt(id), { type: 'u64' }), addressToScVal(caller)],
+      opts,
+    );
   }
 
   /**
-   * Hand a stream off to `newRecipient`, e.g. after a key rotation or a sale.
-   * The connected wallet signs as the contract's `caller` and must be the
-   * stream's current recipient, otherwise the call fails with `UNAUTHORIZED`.
-   *
-   * Everything not yet withdrawn — including a balance that has vested but was
-   * never claimed — becomes withdrawable by `newRecipient` only, so call
-   * `withdraw` first to keep what has already vested.
+   * Cancel the escrow. `caller` must be the payer; a funded escrow can only be
+   * cancelled once its deadline has passed.
    */
-  async transferRecipient(
+  async cancelEscrow<O extends WriteOptions = WriteOptions>(
     id: bigint | number | string,
-    newRecipient: string,
-  ): Promise<{ hash: string }> {
-    const { publicKey } = this.options;
-    if (!publicKey) {
-      throw new Error('A connected wallet is required to submit transactions.');
-    }
-    assertAddress(newRecipient, 'newRecipient');
+    caller: string,
+    opts: O = {} as O,
+  ): Promise<WriteResultFor<O>> {
     return this.invoke(
-      'transfer_recipient',
-      nativeToScVal(BigInt(id), { type: 'u64' }),
-      addressToScVal(publicKey),
-      addressToScVal(newRecipient),
+      'cancel_escrow',
+      [nativeToScVal(BigInt(id), { type: 'u64' }), addressToScVal(caller)],
+      opts,
     );
   }
 }
 
-interface RawStream {
-  id: bigint;
-  sender: string;
-  recipient: string;
-  token: string;
-  total_amount: bigint;
-  withdrawn: bigint;
-  start_time: bigint;
-  end_time: bigint;
-  cliff_time: bigint;
-  label: string;
-  reference: string;
-  cancelled: boolean;
-}
-
-interface RawConfig {
-  admin: string;
-  treasury: string;
-  fee_bps: number;
-}
-
-function normalizeStream(raw: RawStream): Stream {
-  return {
-    id: raw.id.toString(),
-    sender: raw.sender,
-    recipient: raw.recipient,
-    token: raw.token,
-    totalAmount: raw.total_amount.toString(),
-    withdrawn: raw.withdrawn.toString(),
-    startTime: Number(raw.start_time),
-    endTime: Number(raw.end_time),
-    cliffTime: Number(raw.cliff_time),
-    label: raw.label,
-    reference: raw.reference,
-    cancelled: raw.cancelled,
+/** The configured endpoints, primary first, without duplicates or blanks. */
+function configuredRpcUrls(options: StreamsClientOptions): string[] {
+  const urls: string[] = [];
+  const add = (url: string | undefined) => {
+    const trimmed = url?.trim();
+    if (trimmed && !urls.includes(trimmed)) urls.push(trimmed);
   };
   if (options.rpcUrls?.length) {
     for (const url of options.rpcUrls) add(url);

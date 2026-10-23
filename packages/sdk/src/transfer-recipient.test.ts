@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Keypair, scValToNative, xdr } from '@stellar/stellar-sdk';
 import * as SorobanRpc from '@stellar/stellar-sdk/rpc';
-import { StreamsError } from './index';
+import { StreamsError, type StreamsClientOptions } from './index';
 import {
   PUBLIC_KEY,
+  fakeTransport,
   invokedCall,
-  makeClient,
-  mockRpc,
+  makeClient as makeBaseClient,
   sendResponse,
   simulateByMethod,
   simulationError,
@@ -18,10 +18,12 @@ import {
 const { GetTransactionStatus } = SorobanRpc.Api;
 
 describe('transferRecipient', () => {
-  let rpc: ReturnType<typeof mockRpc>;
+  let rpc: ReturnType<typeof fakeTransport>;
+  const makeClient = (overrides: Partial<StreamsClientOptions> = {}) =>
+    makeBaseClient({ transport: rpc, ...overrides });
 
   beforeEach(() => {
-    rpc = mockRpc();
+    rpc = fakeTransport();
   });
 
   afterEach(() => {
@@ -65,7 +67,7 @@ describe('transferRecipient', () => {
 
   it.each([
     [6, 'UNAUTHORIZED'],
-    [12, 'SAME_RECIPIENT'],
+    [20, 'SAME_RECIPIENT'],
   ] as const)(
     'surfaces contract error #%i as %s before asking the wallet to sign',
     async (contractCode, code) => {

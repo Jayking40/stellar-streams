@@ -34,6 +34,7 @@ between `start_time` and `end_time`, with an optional cliff.
 | `set_fee`            | `fee_bps: u32`                                                                                                                                         | `Result<(), StreamError>`                                               | stored `admin`                                 |
 | `set_treasury`       | `treasury: Address`                                                                                                                                    | `Result<(), StreamError>`                                               | stored `admin`                                 |
 | `create_stream`      | `sender: Address, recipient: Address, token: Address, amount: i128, start_time: u64, end_time: u64, cliff_time: u64, label: String, reference: String` | `Result<u64, StreamError>` — the new stream id                          | `sender`                                       |
+| `create_streams`     | `sender: Address, token: Address, entries: Vec<(Address, i128, u64, u64, u64)>`                                                                        | `Result<Vec<u64>, StreamError>` — the new ids, in input order           | `sender`                                       |
 | `withdraw`           | `stream_id: u64`                                                                                                                                       | `Result<i128, StreamError>` — net amount paid after fee                 | `recipient`                                    |
 | `cancel`             | `stream_id: u64`                                                                                                                                       | `Result<(), StreamError>`                                               | `sender`                                       |
 | `transfer_recipient` | `stream_id: u64, caller: Address, new_recipient: Address`                                                                                              | `Result<(), StreamError>`                                               | `caller`, which must be the stored `recipient` |
@@ -42,6 +43,7 @@ between `start_time` and `end_time`, with an optional cliff.
 | `get_stream`         | `stream_id: u64`                                                                                                                                       | `Option<Stream>`                                                        | —                                              |
 | `get_config`         | —                                                                                                                                                      | `Option<Config>` (`None` if uninitialized)                              | —                                              |
 | `next_stream_id`     | —                                                                                                                                                      | `u64` (`1` on a fresh deploy)                                           | —                                              |
+| `version`            | —                                                                                                                                                      | `u32` (the shared `CONTRACT_VERSION`)                                   | —                                              |
 
 Types returned by the views:
 
@@ -79,13 +81,47 @@ rather than by calling `recipient.require_auth()`, so that any other signer
 gets a typed `Unauthorized` instead of a host auth trap. It works on cancelled
 streams too, which lets a recipient move a still-unclaimed vested remainder.
 
+### Batched creation
+
+`create_streams` opens a whole payroll batch in one transaction. Each entry is
+`(recipient, amount, start_time, cliff_time, end_time)` — `cliff_time` precedes
+`end_time`, following the order in issue #184, which differs from
+`create_stream`'s argument list. Batches carry no metadata: every stream stores
+empty `label` and `reference` strings. `sender` funds every stream and
+authorizes once for the whole batch; it is the same creator/funder as
+`create_stream`'s `sender`, not the protocol `admin` stored by `initialize`.
+
+The call is all-or-nothing. Every entry is validated with the same rules as
+`create_stream` and the deposits are summed with checked arithmetic before the
+first token transfer or storage write. One bad row returns its error (`1`–`3`)
+with no streams created, no tokens moved and `next_stream_id` unchanged, so a
+payroll can never be half paid out. Each stream pulls its own deposit, so the
+contract's balance and every `total_amount` match N separate `create_stream`
+calls.
+
+`ids[i]` belongs to `entries[i]`: ids are allocated sequentially from
+`next_stream_id` in input order and one `created` event is emitted per stream in
+the same order. Empty batches return `EmptyBatch` (`13`) instead of burning a fee
+on a no-op, and batches longer than `MAX_BATCH` return `BatchTooLarge` (`14`).
+
+`MAX_BATCH` is `14`. A batch writes one stream entry and emits one
+`StreamCreated` event per entry, so cost grows linearly: measured on mainnet
+limits with soroban-env-host 27, a stream costs ~232k CPU instructions, ~33 KB of
+memory, one ledger-entry write and 548 event bytes. The event budget (16,384
+bytes per transaction) is the binding constraint, and `14` is the largest batch
+whose events still fit in half of it (7,672 bytes), which keeps a 2× margin on
+every limit and room for `StreamCreated` to grow. The
+`test_create_streams_max_batch_fits_mainnet_limits` test measures a maximum-size
+batch against the mainnet instruction, memory, write-entry, write-byte and
+event-size limits. Larger payroll runs are split into multiple batches.
+
 ### Errors — `StreamError` (`#[repr(u32)]`)
 
 | Code | Variant              | Produced when                                                                                                                                                                                                                                                                  |
 | :--: | :------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-|  1   | `InvalidAmount`      | `create_stream` with `amount <= 0`.                                                                                                                                                                                                                                            |
-|  2   | `InvalidTimeRange`   | `create_stream` with `end_time <= start_time`.                                                                                                                                                                                                                                 |
-|  3   | `InvalidCliff`       | `create_stream` with `cliff_time < start_time` or `cliff_time > end_time`.                                                                                                                                                                                                     |
+|  1   | `InvalidAmount`      | `create_stream`, or one `create_streams` entry, with `amount <= 0`.                                                                                                                                                                                                            |
+|  2   | `InvalidTimeRange`   | `create_stream`, or one `create_streams` entry, with `end_time <= start_time`.                                                                                                                                                                                                 |
+|  3   | `InvalidCliff`       | `create_stream`, or one `create_streams` entry, with `cliff_time < start_time` or `cliff_time > end_time`.                                                                                                                                                                     |
 |  4   | `StreamNotFound`     | No stored stream under `stream_id` — raised by `withdraw`, `cancel`, `claimable`, `vested`. Also what a recipient sees if a persistent entry was archived after its TTL lapsed.                                                                                                |
 |  5   | `NothingToWithdraw`  | `withdraw` when `vested(now) - withdrawn <= 0` — before the cliff, at the start of a stream, after a full withdrawal, or for a stream whose vested amount is `0`.                                                                                                              |
 |  6   | `Unauthorized`       | `set_fee` or `set_treasury` called before `initialize` stored an admin, or `transfer_recipient` with a `caller` other than the stream's current recipient. Otherwise a wrong-signer call is not this code: `require_auth()` traps with a `Context` error before the body runs. |
@@ -94,7 +130,11 @@ streams too, which lets a recipient move a still-unclaimed vested remainder.
 |  9   | `AlreadyInitialized` | A second `initialize` call — the presence of `DataKey::Admin` is the guard.                                                                                                                                                                                                    |
 |  10  | `TreasuryNotSet`     | `withdraw` when the fee is non-zero but no treasury address is stored.                                                                                                                                                                                                         |
 |  11  | `MetadataTooLong`    | `create_stream` when `label.len() > 64` or `reference.len() > 128`. Checked with the other arguments, before any token moves.                                                                                                                                                  |
-|  12  | `SameRecipient`      | `transfer_recipient` when `new_recipient` is already the stream's recipient, so a no-op hand-off never emits a `transferred` event.                                                                                                                                            |
+|  12  | `InvalidStartTime`   | `create_stream`, or one `create_streams` entry, with `start_time < env.ledger().timestamp()`. A `start_time` equal to the current ledger time is accepted. Checked before any token moves.                                                                                     |
+|  13  | `EmptyBatch`         | `create_streams` with no entries. Checked before validation, transfer or storage writes.                                                                                                                                                                                       |
+|  14  | `BatchTooLarge`      | `create_streams` with more than `MAX_BATCH` (14) entries.                                                                                                                                                                                                                      |
+|  15  | `BatchOverflow`      | `create_streams` whose deposits sum past `i128::MAX`, or whose id range would overflow `u64`. Checked before any token moves.                                                                                                                                                  |
+|  20  | `SameRecipient`      | `transfer_recipient` when `new_recipient` is already the stream's recipient, so a no-op hand-off never emits a `transferred` event.                                                                                                                                            |
 
 `STREAM_ERROR_CODES` in `packages/sdk/src/index.ts` is the one place these
 numbers are named on the client side; codes outside that table fall back to the
@@ -107,12 +147,12 @@ as a `u64` in topic three. The remaining fields are the event _data_, emitted as
 a **map keyed by field name** (the `#[contractevent]` struct's non-`#[topic]`
 fields), not as a positional tuple, so decoding does not depend on field order.
 
-| Topics                               | Data fields                                                                                   | Published by         |
-| :----------------------------------- | :-------------------------------------------------------------------------------------------- | :------------------- |
-| `("stream", "created", id: u64)`     | `sender: Address`, `recipient: Address`, `amount: i128`, `label: String`, `reference: String` | `create_stream`      |
-| `("stream", "withdrawn", id: u64)`   | `recipient: Address`, `amount: i128`, `fee: i128`                                             | `withdraw`           |
-| `("stream", "cancelled", id: u64)`   | `sender: Address`, `refunded: i128`                                                           | `cancel`             |
-| `("stream", "transferred", id: u64)` | `old_recipient: Address`, `new_recipient: Address`                                            | `transfer_recipient` |
+| Topics                               | Data fields                                                                                   | Published by                                                      |
+| :----------------------------------- | :-------------------------------------------------------------------------------------------- | :---------------------------------------------------------------- |
+| `("stream", "created", id: u64)`     | `sender: Address`, `recipient: Address`, `amount: i128`, `label: String`, `reference: String` | `create_stream`, `create_streams` (one per entry, in input order) |
+| `("stream", "withdrawn", id: u64)`   | `recipient: Address`, `amount: i128`, `fee: i128`                                             | `withdraw`                                                        |
+| `("stream", "cancelled", id: u64)`   | `sender: Address`, `refunded: i128`                                                           | `cancel`                                                          |
+| `("stream", "transferred", id: u64)` | `old_recipient: Address`, `new_recipient: Address`                                            | `transfer_recipient`                                              |
 
 The Rust event types are `StreamCreated`, `StreamWithdrawn`, `StreamCancelled`
 and `StreamRecipientTransferred`; their field names are exactly the map keys
@@ -195,14 +235,16 @@ with deadline-driven cancellation.
 
 ### Entry points
 
-| Function         | Arguments                                                                                                | Returns                   | Auth                                       |
-| :--------------- | :------------------------------------------------------------------------------------------------------- | :------------------------ | :----------------------------------------- |
-| `create_escrow`  | `id: u64, payer: Address, payee: Address, arbiter: Address, token: Address, amount: i128, deadline: u64` | `Result<(), EscrowError>` | `payer`                                    |
-| `fund_escrow`    | `id: u64`                                                                                                | `Result<(), EscrowError>` | `payer`                                    |
-| `release_escrow` | `id: u64, caller: Address`                                                                               | `Result<(), EscrowError>` | `caller`, who must be `payer` or `arbiter` |
-| `refund_escrow`  | `id: u64, caller: Address`                                                                               | `Result<(), EscrowError>` | `caller`, who must be `payee` or `arbiter` |
-| `cancel_escrow`  | `id: u64, caller: Address`                                                                               | `Result<(), EscrowError>` | `caller`, who must be `payer`              |
-| `get_escrow`     | `id: u64`                                                                                                | `Option<Escrow>`          | —                                          |
+| Function         | Arguments                                                                                       | Returns                                        | Auth                                       |
+| :--------------- | :---------------------------------------------------------------------------------------------- | :--------------------------------------------- | :----------------------------------------- |
+| `create_escrow`  | `payer: Address, payee: Address, arbiter: Address, token: Address, amount: i128, deadline: u64` | `Result<u64, EscrowError>` — the new escrow id | `payer`                                    |
+| `fund_escrow`    | `id: u64`                                                                                       | `Result<(), EscrowError>`                      | `payer`                                    |
+| `release_escrow` | `id: u64, caller: Address`                                                                      | `Result<(), EscrowError>`                      | `caller`, who must be `payer` or `arbiter` |
+| `refund_escrow`  | `id: u64, caller: Address`                                                                      | `Result<(), EscrowError>`                      | `caller`, who must be `payee` or `arbiter` |
+| `cancel_escrow`  | `id: u64, caller: Address`                                                                      | `Result<(), EscrowError>`                      | `caller`, who must be `payer`              |
+| `get_escrow`     | `id: u64`                                                                                       | `Option<Escrow>`                               | —                                          |
+| `next_escrow_id` | —                                                                                               | `u64` (`1` on a fresh deploy)                  | —                                          |
+| `version`        | —                                                                                               | `u32` (the shared `CONTRACT_VERSION`)          | —                                          |
 
 ```rust
 struct Escrow {
@@ -245,8 +287,7 @@ signed, and a mismatch between the signer and `caller` fails at `require_auth()`
 | Code | Variant                  | Produced when                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | :--: | :----------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 |  1   | `EscrowNotFound`         | No stored escrow under `id` — `fund_escrow`, `release_escrow`, `refund_escrow`, `cancel_escrow`.                                                                                                                                                                                                                                                                                                                                              |
-|  2   | `EscrowAlreadyExists`    | `create_escrow` with an `id` already in storage.                                                                                                                                                                                                                                                                                                                                                                                              |
-|  3   | `InvalidAmount`          | `create_escrow` with `amount <= 0`. Checked after the duplicate-id test and before `payer`'s auth.                                                                                                                                                                                                                                                                                                                                            |
+|  3   | `InvalidAmount`          | `create_escrow` with `amount <= 0`. Checked before `payer`'s auth.                                                                                                                                                                                                                                                                                                                                                                            |
 |  4   | `UnauthorizedOperation`  | `release_escrow` by an address that is neither `payer` nor `arbiter`; `refund_escrow` by an address that is neither `payee` nor `arbiter`; `cancel_escrow` by anyone other than `payer`.                                                                                                                                                                                                                                                      |
 |  5   | `InvalidStateTransition` | `fund_escrow` when not `Created`; `release_escrow`/`refund_escrow` while still `Created` (funds have not been locked yet).                                                                                                                                                                                                                                                                                                                    |
 |  6   | `DeadlineNotReached`     | `cancel_escrow` on a `Funded` escrow while `ledger().timestamp() < deadline`.                                                                                                                                                                                                                                                                                                                                                                 |
